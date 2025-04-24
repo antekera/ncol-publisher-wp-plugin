@@ -2,7 +2,7 @@
 /*
 Plugin Name: Ncol Publisher
 Description: Publica automáticamente entradas en Facebook, X y WhatsApp vía AWS API Gateway.
-Version: 1.4
+Version: 1.5
 Author: Miguel Antequera
 */
 
@@ -27,7 +27,8 @@ function render_social_meta_box($post) {
         'facebook' => 'Facebook',
         'twitter' => 'X',
         'whatsapp' => 'WhatsApp',
-        'instagram' => 'Instagram'
+        'instagram' => 'Instagram',
+        'threads' => 'Threads'
     ];
 
     foreach ($networks as $key => $label) {
@@ -51,51 +52,59 @@ add_action('save_post', function($post_id) {
     if (defined('DOING_AUTOSAVE') && DOING_AUTOSAVE) return;
     if (!current_user_can('edit_post', $post_id)) return;
 
-    $fields = ['facebook', 'twitter', 'whatsapp', 'instagram'];
+    $fields = ['facebook', 'twitter', 'whatsapp', 'instagram', 'threads'];
     foreach ($fields as $field) {
         $value = isset($_POST['publish_' . $field]) ? '1' : '0';
         update_post_meta($post_id, '_publish_' . $field, $value);
     }
 });
 
-// Hook al publicar
-add_action('save_post', function($post_id, $post, $update) {
-    if ($post->post_status !== 'publish') return;
-    if (defined('DOING_AUTOSAVE') && DOING_AUTOSAVE) return;
-    if (!current_user_can('edit_post', $post_id)) return;
+// Hook confiable para publicar luego de guardar metadatos
+add_action('transition_post_status', function($new_status, $old_status, $post) {
+    $post_id = $post->ID;
 
-    $fields = ['facebook', 'twitter', 'whatsapp', 'instagram'];
+    error_log("🟡 [NcolPublisher] transition_post_status: $old_status -> $new_status para post ID: $post_id");
+
+    if ($new_status !== 'publish') {
+        error_log("🔴 [NcolPublisher] Nuevo estado no es 'publish', abortando.");
+        return;
+    }
+
+    $fields = ['facebook', 'twitter', 'whatsapp', 'instagram', 'threads'];
     $platforms = [];
 
     foreach ($fields as $field) {
-        if (get_post_meta($post_id, "_publish_$field", true) === '1') {
+        $val = isset($_POST['publish_' . $field]) ? '1' : '0';
+        error_log("🟡 Plataforma $field desde POST (por defecto 0 si ausente): $val");
+
+        if ($val === '1') {
             $platforms[] = $field;
         }
     }
 
-    if (empty($platforms)) return;
+    if (empty($platforms)) {
+        error_log("🔴 [NcolPublisher] Ninguna plataforma seleccionada, abortando.");
+        return;
+    }
 
-    $previous_platforms = get_post_meta($post_id, '_ncol_published_platforms', true);
-    if (empty($previous_platforms)) $previous_platforms = [];
-    $new_platforms = array_diff($platforms, $previous_platforms);
-    if (empty($new_platforms)) return;
-    $platforms = $new_platforms;
+    // Siempre enviamos todas las plataformas seleccionadas y dejamos que la Lambda decida si publicar o no
+    error_log("🟡 [NcolPublisher] Enviando plataformas seleccionadas para evaluación en Lambda: " . implode(', ', $platforms));
 
     $permalink = get_permalink($post_id);
     $permalink = str_replace('https://admin.noticiascol.com', 'https://www.noticiascol.com', $permalink);
+    $image_url = get_the_post_thumbnail_url($post_id, 'large') ?: null;
 
-    $image_url = get_the_post_thumbnail_url($post_id, 'large');
     $payload = [
         'postId' => (string) $post_id,
         'title' => get_the_title($post_id),
         'permalink' => $permalink,
         'excerpt' => get_the_excerpt($post_id),
         'targetPlatforms' => $platforms,
+        'imageUrl' => $image_url,
+        'content' => apply_filters('the_content', $post->post_content),
     ];
 
-    if ($image_url) {
-        $payload['imageUrl'] = $image_url;
-    }
+    error_log("🟢 Imagen incluida: " . ($image_url ?: 'No image'));
 
     $invoke_url = get_option('ncol_publisher_api_url');
     $api_key    = get_option('ncol_publisher_api_key');
@@ -105,7 +114,7 @@ add_action('save_post', function($post_id, $post, $update) {
         return;
     }
 
-    error_log("🟢 Ncol Publisher [save_post] ejecutado para el post '{$post->post_title}' (ID {$post_id})");
+    error_log("🟢 Ncol Publisher [transition_post_status] ejecutado para el post '{$post->post_title}' (ID {$post_id})");
     error_log("🟢 Plataformas seleccionadas: " . implode(', ', $platforms));
 
     $response = wp_remote_post($invoke_url, [
@@ -126,10 +135,11 @@ add_action('save_post', function($post_id, $post, $update) {
             error_log("🟢 Ncol Publisher: Error HTTP $code - " . wp_remote_retrieve_body($response));
         } else {
             error_log("🟢 Ncol Publisher: Publicación enviada con éxito para el post ID: $post_id");
+            $previous_platforms = get_post_meta($post_id, '_ncol_published_platforms', true) ?: [];
             update_post_meta($post_id, '_ncol_published_platforms', array_merge($previous_platforms, $platforms));
         }
     }
-}, 10, 3);
+}, 20, 3);
 
 // Configuración en el admin
 add_action('admin_menu', function() {
@@ -149,6 +159,7 @@ add_action('admin_init', function() {
     register_setting('ncol_publisher_options', 'ncol_publisher_enabled_twitter');
     register_setting('ncol_publisher_options', 'ncol_publisher_enabled_whatsapp');
     register_setting('ncol_publisher_options', 'ncol_publisher_enabled_instagram');
+    register_setting('ncol_publisher_options', 'ncol_publisher_enabled_threads');
 });
 
 function ncol_publisher_settings_page() {
@@ -175,7 +186,8 @@ function ncol_publisher_settings_page() {
                    <label><input type="checkbox" name="ncol_publisher_enabled_facebook" value="1" <?php checked(get_option('ncol_publisher_enabled_facebook'), '1'); ?> /> Facebook</label><br>
                    <label><input type="checkbox" name="ncol_publisher_enabled_twitter" value="1" <?php checked(get_option('ncol_publisher_enabled_twitter'), '1'); ?> /> X / Twitter</label><br>
                    <label><input type="checkbox" name="ncol_publisher_enabled_whatsapp" value="1" <?php checked(get_option('ncol_publisher_enabled_whatsapp'), '1'); ?> /> WhatsApp</label><br>
-                   <label><input type="checkbox" name="ncol_publisher_enabled_instagram" value="1" <?php checked(get_option('ncol_publisher_enabled_instagram'), '1'); ?> /> Instagram</label>
+                   <label><input type="checkbox" name="ncol_publisher_enabled_instagram" value="1" <?php checked(get_option('ncol_publisher_enabled_instagram'), '1'); ?> /> Instagram</label><br>
+                   <label><input type="checkbox" name="ncol_publisher_enabled_threads" value="1" <?php checked(get_option('ncol_publisher_enabled_threads'), '1'); ?> /> Threads</label>
                 </td>
             </tr>
             </table>
@@ -184,3 +196,65 @@ function ncol_publisher_settings_page() {
     </div>
     <?php
 }
+
+// Endpoints personalizados para Facebook Login, Deauthorize y Data Deletion
+add_action('init', function () {
+    add_rewrite_rule('^facebook-callback/?', 'index.php?facebook_callback=1', 'top');
+    add_rewrite_rule('^facebook-deauthorize/?', 'index.php?facebook_deauthorize=1', 'top');
+    add_rewrite_rule('^facebook-data-deletion/?', 'index.php?facebook_data_deletion=1', 'top');
+
+    add_rewrite_rule('^threads-callback/?', 'index.php?threads_callback=1', 'top');
+    add_rewrite_rule('^threads-deauthorize/?', 'index.php?threads_deauthorize=1', 'top');
+    add_rewrite_rule('^threads-data-deletion/?', 'index.php?threads_data_deletion=1', 'top');
+});
+
+add_filter('query_vars', function ($vars) {
+    $vars[] = 'facebook_callback';
+    $vars[] = 'facebook_deauthorize';
+    $vars[] = 'facebook_data_deletion';
+
+    $vars[] = 'threads_callback';
+    $vars[] = 'threads_deauthorize';
+    $vars[] = 'threads_data_deletion';
+
+    return $vars;
+});
+
+add_action('template_redirect', function () {
+    if (get_query_var('facebook_callback')) {
+        status_header(200);
+        echo "<h1>✅ Autenticación de Facebook completada</h1><p>Puedes cerrar esta ventana.</p>";
+        exit;
+    }
+
+    if (get_query_var('facebook_deauthorize')) {
+        status_header(200);
+        echo "<h1>Desautorización recibida</h1><p>Tu cuenta fue desvinculada de nuestra aplicación.</p>";
+        exit;
+    }
+
+    if (get_query_var('facebook_data_deletion')) {
+        status_header(200);
+        echo "<h1>Eliminación de datos</h1><p>Si deseas eliminar tus datos de nuestra plataforma, por favor contáctanos a contacto@noticiascol.com y atenderemos tu solicitud.</p>";
+        exit;
+    }
+
+    // Threads
+    if (get_query_var('threads_callback')) {
+        status_header(200);
+        echo "<h1>✅ Autenticación de Threads completada</h1><p>Puedes cerrar esta ventana.</p>";
+        exit;
+    }
+
+    if (get_query_var('threads_deauthorize')) {
+        status_header(200);
+        echo "<h1>Desautorización de Threads</h1><p>Tu cuenta de Threads fue desvinculada.</p>";
+        exit;
+    }
+
+    if (get_query_var('threads_data_deletion')) {
+        status_header(200);
+        echo "<h1>Eliminación de datos de Threads</h1><p>Contáctanos a contacto@noticiascol.com para eliminar tus datos asociados.</p>";
+        exit;
+    }
+});
